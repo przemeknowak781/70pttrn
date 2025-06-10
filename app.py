@@ -31,17 +31,11 @@ def check_required_files():
     if not os.path.exists(resource_path("shader.frag")):
         missing_files.append("shader.frag")
     
-    # Check for ffmpeg executable
+    # Check for ffmpeg executable by running 'ffmpeg -version'
     try:
-        # Use ffmpeg-python's internal probe to check for ffmpeg
-        ffmpeg.probe(None) 
-    except ffmpeg.Error as e:
-        # Check if the error message indicates that ffmpeg was not found
-        if "No such file or directory" in e.stderr.decode() or "cannot find program" in e.stderr.decode():
-             missing_files.append("ffmpeg (Ensure it's in your system's PATH)")
-        else:
-            # Another ffmpeg error occurred, but the executable was likely found
-            pass
+        subprocess.run(['ffmpeg', '-version'], check=True, capture_output=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        missing_files.append("ffmpeg (Ensure it's in your system's PATH)")
 
     return missing_files
 
