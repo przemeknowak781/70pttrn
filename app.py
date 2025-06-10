@@ -11,11 +11,9 @@ import platform
 import random
 import time
 import zipfile
+import ffmpeg # <-- Import ffmpeg-python
 from datetime import datetime
 from pathlib import Path
-
-# --- Constants and Setup ---
-FFMPEG_PATH = 'ffmpeg' # Default path, user can override in UI
 
 # --- Helper Functions ---
 
@@ -25,16 +23,8 @@ def resource_path(relative_path):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
 
-def safe_popen(*args, **kwargs):
-    """ Popen wrapper for cross-platform compatibility """
-    if platform.system() == 'Windows':
-        kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        kwargs['preexec_fn'] = os.setsid
-    return subprocess.Popen(*args, **kwargs)
-
 def check_required_files():
-    """ Check if shader and ffmpeg files exist """
+    """ Check if shader files exist and if ffmpeg can be found """
     missing_files = []
     if not os.path.exists(resource_path("shader.vert")):
         missing_files.append("shader.vert")
@@ -43,9 +33,15 @@ def check_required_files():
     
     # Check for ffmpeg executable
     try:
-        subprocess.run([FFMPEG_PATH, "-version"], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        missing_files.append("ffmpeg (Ensure it's in your system's PATH or provide the correct path in the sidebar)")
+        # Use ffmpeg-python's internal probe to check for ffmpeg
+        ffmpeg.probe(None) 
+    except ffmpeg.Error as e:
+        # Check if the error message indicates that ffmpeg was not found
+        if "No such file or directory" in e.stderr.decode() or "cannot find program" in e.stderr.decode():
+             missing_files.append("ffmpeg (Ensure it's in your system's PATH)")
+        else:
+            # Another ffmpeg error occurred, but the executable was likely found
+            pass
 
     return missing_files
 
@@ -90,7 +86,7 @@ def rand_params(n, seed):
             }
         }
 
-# --- Core Logic from gen_videos.py ---
+# --- Core Logic: REBUILT with ffmpeg-python ---
 
 VERTEX_SHADER_SOURCE = open(resource_path("shader.vert")).read() if os.path.exists(resource_path("shader.vert")) else ""
 FRAGMENT_SHADER_SOURCE = open(resource_path("shader.frag")).read() if os.path.exists(resource_path("shader.frag")) else ""
@@ -104,7 +100,7 @@ quad_vertices = np.array([
 
 def generate_video(params):
     start = time.time()
-    width, height, fps, duration, parameters, output_format, output_dir, index, ffmpeg_path, preset, workers_total = params
+    width, height, fps, duration, parameters, output_format, output_dir, index, preset, workers_total = params
     shader_parameters = parameters["shader_parameters"]
 
     try:
@@ -130,32 +126,56 @@ def generate_video(params):
         )
         
         threads_per_ffmpeg = max(1, multiprocessing.cpu_count() // workers_total)
-        
-        ffmpeg_cmd = [
-            ffmpeg_path, '-y', '-f', 'rawvideo', '-pix_fmt', 'yuv444p',
-            '-s', f'{width}x{height}', '-r', str(fps),
-            '-color_range', 'tv', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709', '-i', '-',
-            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-profile:v', 'high', '-level', '5.2', 
-            '-preset', preset, '-threads', str(threads_per_ffmpeg), '-movflags', '+faststart',
-            '-color_range', 'tv', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
-            str(output_path),
-            '-nostats', '-loglevel', 'error',
-        ]
-
-        ffmpeg_subproc = safe_popen(ffmpeg_cmd, stdin=subprocess.PIPE)
-
         total_frames = int(duration * fps) if duration > 0 else int(2 * np.pi / shader_parameters.get('uStep', 0.01))
+
+        # --- ffmpeg-python integration ---
+        process = (
+            ffmpeg
+            .input(
+                'pipe:',
+                format='rawvideo',
+                pix_fmt='yuv444p',
+                s=f'{width}x{height}',
+                r=str(fps),
+                color_range='tv',
+                colorspace='bt709',
+                color_primaries='bt709',
+                color_trc='bt709'
+            )
+            .output(
+                str(output_path),
+                pix_fmt='yuv420p',
+                **{
+                    'c:v': 'libx264',
+                    'profile:v': 'high',
+                    'level': '5.2',
+                    'preset': preset,
+                    'threads': threads_per_ffmpeg,
+                    'movflags': '+faststart',
+                    'color_range': 'tv',
+                    'colorspace': 'bt709',
+                    'color_primaries': 'bt709',
+                    'color_trc': 'bt709'
+                }
+            )
+            .overwrite_output()
+            .run_async(pipe_stdin=True, quiet=True)
+        )
+        # --- End ffmpeg-python integration ---
 
         for i in range(total_frames):
             if 'uIndex' in prog:
                 prog['uIndex'].value = i
             vao.render(mode=moderngl.TRIANGLE_STRIP)
             for tex in (y_tex, u_tex, v_tex):
-                ffmpeg_subproc.stdin.write(tex.read(alignment=1))
+                process.stdin.write(tex.read(alignment=1))
 
-        ffmpeg_subproc.stdin.close()
-        ffmpeg_subproc.wait()
+        process.stdin.close()
+        process.wait()
     except Exception as e:
+        # Check if it's an ffmpeg error and provide stderr
+        if isinstance(e, ffmpeg.Error):
+             return f"Error during ffmpeg processing for video {index}: {e.stderr.decode()}"
         return f"Error generating video {index}: {e}"
 
     end = time.time()
@@ -174,7 +194,7 @@ st.markdown("This tool generates videos from a GLSL shader. Configure parameters
 # Check for required files at the start
 missing = check_required_files()
 if missing:
-    st.error(f"**Missing Required Files:**\n\n" + "\n".join([f"- `{m}`" for m in missing]) + "\n\nPlease make sure these files are available before starting.")
+    st.error(f"**Missing Required Files or Programs:**\n\n" + "\n".join([f"- `{m}`" for m in missing]) + "\n\nPlease make sure these are available before starting.")
     st.stop()
 
 
@@ -204,8 +224,7 @@ with st.sidebar:
         uploaded_file = st.file_uploader("Choose a params.json file", type="json")
 
     with st.expander("Advanced Settings"):
-        st.text_input("FFmpeg Path", value=FFMPEG_PATH, key="ffmpeg_path")
-        preset = st.selectbox("FFmpeg Preset", ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], index=5)
+        preset = st.selectbox("FFmpeg Preset", ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], index=5, help="Controls the encoding speed vs. compression ratio. 'ultrafast' is quickest, 'veryslow' gives the best quality/size.")
         workers = st.slider("Number of Parallel Workers", min_value=1, max_value=multiprocessing.cpu_count(), value=max(1, multiprocessing.cpu_count() // 2))
         output_format = st.text_input("Output Filename Format", value="{name_prefix}-{index:04d}.mp4")
 
@@ -244,7 +263,7 @@ if st.button("🚀 Start Generating Videos"):
             width, height, fps, duration,
             params,
             output_format, output_dir, i,
-            st.session_state.ffmpeg_path, preset, workers
+            preset, workers
         )
         for i, params in enumerate(parameters_list)
     ]
